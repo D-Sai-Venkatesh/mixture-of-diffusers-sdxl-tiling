@@ -12,23 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from enum import Enum
 import inspect
+from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from transformers import (
-    CLIPImageProcessor,
     CLIPTextModel,
     CLIPTextModelWithProjection,
     CLIPTokenizer,
-    CLIPVisionModelWithProjection,
 )
 
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.loaders import (
     FromSingleFileMixin,
-    IPAdapterMixin,
     StableDiffusionXLLoraLoaderMixin,
     TextualInversionLoaderMixin,
 )
@@ -39,6 +36,8 @@ from diffusers.models.attention_processor import (
     XFormersAttnProcessor,
 )
 from diffusers.models.lora import adjust_lora_scale_text_encoder
+from diffusers.pipelines.pipeline_utils import DiffusionPipeline, StableDiffusionMixin
+from diffusers.pipelines.stable_diffusion_xl.pipeline_output import StableDiffusionXLPipelineOutput
 from diffusers.schedulers import KarrasDiffusionSchedulers, LMSDiscreteScheduler
 from diffusers.utils import (
     USE_PEFT_BACKEND,
@@ -50,11 +49,10 @@ from diffusers.utils import (
     unscale_lora_layers,
 )
 from diffusers.utils.torch_utils import randn_tensor
-from diffusers.pipelines.pipeline_utils import DiffusionPipeline, StableDiffusionMixin
-from diffusers.pipelines.stable_diffusion_xl.pipeline_output import StableDiffusionXLPipelineOutput
+
 
 try:
-    from ligo.segments import segment    
+    from ligo.segments import segment
 except ImportError:
     raise ImportError("Please install transformers and ligo-segments to use the mixture pipeline")
 
@@ -86,6 +84,7 @@ EXAMPLE_DOC_STRING = """
         >>> image = pipe(prompt).images[0]
         ```
 """
+
 
 def _tile2pixel_indices(tile_row, tile_col, tile_width, tile_height, tile_row_overlap, tile_col_overlap):
     """Given a tile row and column numbers returns the range of pixels affected by that tiles in the overall image
@@ -151,6 +150,7 @@ def _tile2latent_exclusive_indices(
     # return row_init, row_end, col_init, col_end
     return row_segment[0], row_segment[1], col_segment[0], col_segment[1]
 
+
 # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.rescale_noise_cfg
 def rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=0.0):
     r"""
@@ -210,7 +210,7 @@ def retrieve_timesteps(
         `Tuple[torch.Tensor, int]`: A tuple where the first element is the timestep schedule from the scheduler and the
         second element is the number of inference steps.
     """
-    
+
     if timesteps is not None and sigmas is not None:
         raise ValueError("Only one of `timesteps` or `sigmas` can be passed. Please choose one to set custom values")
     if timesteps is not None:
@@ -245,7 +245,6 @@ class StableDiffusionXLTilingPipeline(
     FromSingleFileMixin,
     StableDiffusionXLLoraLoaderMixin,
     TextualInversionLoaderMixin,
-    IPAdapterMixin,
 ):
     r"""
     Pipeline for text-to-image generation using Stable Diffusion XL.
@@ -258,7 +257,6 @@ class StableDiffusionXLTilingPipeline(
         - [`~loaders.FromSingleFileMixin.from_single_file`] for loading `.ckpt` files
         - [`~loaders.StableDiffusionXLLoraLoaderMixin.load_lora_weights`] for loading LoRA weights
         - [`~loaders.StableDiffusionXLLoraLoaderMixin.save_lora_weights`] for saving LoRA weights
-        - [`~loaders.IPAdapterMixin.load_ip_adapter`] for loading IP Adapters
 
     Args:
         vae ([`AutoencoderKL`]):
@@ -298,10 +296,8 @@ class StableDiffusionXLTilingPipeline(
         "tokenizer_2",
         "text_encoder",
         "text_encoder_2",
-        "image_encoder",
-        "feature_extractor",
     ]
-    
+
     def __init__(
         self,
         vae: AutoencoderKL,
@@ -311,8 +307,6 @@ class StableDiffusionXLTilingPipeline(
         tokenizer_2: CLIPTokenizer,
         unet: UNet2DConditionModel,
         scheduler: KarrasDiffusionSchedulers,
-        image_encoder: CLIPVisionModelWithProjection = None,
-        feature_extractor: CLIPImageProcessor = None,
         force_zeros_for_empty_prompt: bool = True,
         add_watermarker: Optional[bool] = None,
     ):
@@ -326,8 +320,6 @@ class StableDiffusionXLTilingPipeline(
             tokenizer_2=tokenizer_2,
             unet=unet,
             scheduler=scheduler,
-            image_encoder=image_encoder,
-            feature_extractor=feature_extractor,
         )
         self.register_to_config(force_zeros_for_empty_prompt=force_zeros_for_empty_prompt)
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1) if getattr(self, "vae", None) else 8
@@ -351,7 +343,7 @@ class StableDiffusionXLTilingPipeline(
 
         FULL = "full"
         EXCLUSIVE = "exclusive"
-        
+
     def encode_prompt(
         self,
         prompt: str,
@@ -589,14 +581,14 @@ class StableDiffusionXLTilingPipeline(
                 unscale_lora_layers(self.text_encoder_2, lora_scale)
 
         return prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds
-   
+
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.prepare_extra_step_kwargs
     def prepare_extra_step_kwargs(self, generator, eta):
         # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
         # eta (η) is only used with the DDIMScheduler, it will be ignored for other schedulers.
         # eta corresponds to η in DDIM paper: https://arxiv.org/abs/2010.02502
         # and should be between [0, 1]
-        
+
         accepts_eta = "eta" in set(inspect.signature(self.scheduler.step).parameters.keys())
         extra_step_kwargs = {}
         if accepts_eta:
@@ -608,15 +600,7 @@ class StableDiffusionXLTilingPipeline(
             extra_step_kwargs["generator"] = generator
         return extra_step_kwargs
 
-    def check_inputs(
-        self,
-        prompt,        
-        height,
-        width,
-        grid_cols,
-        seed_tiles_mode,
-        tiles_mode
-    ):
+    def check_inputs(self, prompt, height, width, grid_cols, seed_tiles_mode, tiles_mode):
         if height % 8 != 0 or width % 8 != 0:
             raise ValueError(f"`height` and `width` have to be divisible by 8 but are {height} and {width}.")
 
@@ -625,18 +609,18 @@ class StableDiffusionXLTilingPipeline(
 
         if not isinstance(prompt, list) or not all(isinstance(row, list) for row in prompt):
             raise ValueError(f"`prompt` has to be a list of lists but is {type(prompt)}")
-        
+
         if not all(len(row) == grid_cols for row in prompt):
             raise ValueError("All prompt rows must have the same number of prompt columns")
-        
+
         if not isinstance(seed_tiles_mode, str) and (
             not isinstance(seed_tiles_mode, list) or not all(isinstance(row, list) for row in seed_tiles_mode)
         ):
             raise ValueError(f"`seed_tiles_mode` has to be a string or list of lists but is {type(prompt)}")
-        
+
         if any(mode not in tiles_mode for row in seed_tiles_mode for mode in row):
             raise ValueError(f"Seed tiles mode must be one of {tiles_mode}")
-        
+
     def _get_add_time_ids(
         self, original_size, crops_coords_top_left, target_size, dtype, text_encoder_projection_dim=None
     ):
@@ -678,8 +662,8 @@ class StableDiffusionXLTilingPipeline(
         weights_np = np.outer(y_probs, x_probs)
         weights_torch = torch.tensor(weights_np, device=device)
         weights_torch = weights_torch.to(dtype)
-        return torch.tile(weights_torch, (nbatches, self.unet.config.in_channels, 1, 1))     
-    
+        return torch.tile(weights_torch, (nbatches, self.unet.config.in_channels, 1, 1))
+
     def upcast_vae(self):
         dtype = self.vae.dtype
         self.vae.to(dtype=torch.float32)
@@ -760,25 +744,25 @@ class StableDiffusionXLTilingPipeline(
     @replace_example_docstring(EXAMPLE_DOC_STRING)
     def __call__(
         self,
-        prompt: Union[str, List[str]] = None,        
+        prompt: Union[str, List[str]] = None,
         height: Optional[int] = None,
         width: Optional[int] = None,
-        num_inference_steps: int = 50,                        
+        num_inference_steps: int = 50,
         guidance_scale: float = 5.0,
-        negative_prompt: Optional[Union[str, List[str]]] = None,        
+        negative_prompt: Optional[Union[str, List[str]]] = None,
         num_images_per_prompt: Optional[int] = 1,
         eta: float = 0.0,
-        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,        
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         output_type: Optional[str] = "pil",
         return_dict: bool = True,
-        cross_attention_kwargs: Optional[Dict[str, Any]] = None,        
+        cross_attention_kwargs: Optional[Dict[str, Any]] = None,
         original_size: Optional[Tuple[int, int]] = None,
         crops_coords_top_left: Tuple[int, int] = (0, 0),
         target_size: Optional[Tuple[int, int]] = None,
         negative_original_size: Optional[Tuple[int, int]] = None,
         negative_crops_coords_top_left: Tuple[int, int] = (0, 0),
         negative_target_size: Optional[Tuple[int, int]] = None,
-        clip_skip: Optional[int] = None,                
+        clip_skip: Optional[int] = None,
         tile_height: Optional[int] = 1024,
         tile_width: Optional[int] = 1024,
         tile_row_overlap: Optional[int] = 128,
@@ -786,7 +770,7 @@ class StableDiffusionXLTilingPipeline(
         guidance_scale_tiles: Optional[List[List[float]]] = None,
         seed_tiles: Optional[List[List[int]]] = None,
         seed_tiles_mode: Optional[Union[str, List[List[str]]]] = "full",
-        seed_reroll_regions: Optional[List[Tuple[int, int, int, int, int]]] = None,        
+        seed_reroll_regions: Optional[List[Tuple[int, int, int, int, int]]] = None,
         **kwargs,
     ):
         r"""
@@ -795,7 +779,7 @@ class StableDiffusionXLTilingPipeline(
         Args:
             prompt (`str` or `List[str]`, *optional*):
                 The prompt or prompts to guide the image generation. If not defined, one has to pass `prompt_embeds`.
-                instead.            
+                instead.
             height (`int`, *optional*, defaults to self.unet.config.sample_size * self.vae_scale_factor):
                 The height in pixels of the generated image. This is set to 1024 by default for the best results.
                 Anything below 512 pixels won't work well for
@@ -808,7 +792,7 @@ class StableDiffusionXLTilingPipeline(
                 and checkpoints that are not specifically fine-tuned on low resolutions.
             num_inference_steps (`int`, *optional*, defaults to 50):
                 The number of denoising steps. More denoising steps usually lead to a higher quality image at the
-                expense of slower inference.                     
+                expense of slower inference.
             guidance_scale (`float`, *optional*, defaults to 5.0):
                 Guidance scale as defined in [Classifier-Free Diffusion Guidance](https://arxiv.org/abs/2207.12598).
                 `guidance_scale` is defined as `w` of equation 2. of [Imagen
@@ -818,7 +802,7 @@ class StableDiffusionXLTilingPipeline(
             negative_prompt (`str` or `List[str]`, *optional*):
                 The prompt or prompts not to guide the image generation. If not defined, one has to pass
                 `negative_prompt_embeds` instead. Ignored when not using guidance (i.e., ignored if `guidance_scale` is
-                less than `1`).           
+                less than `1`).
             num_images_per_prompt (`int`, *optional*, defaults to 1):
                 The number of images to generate per prompt.
             eta (`float`, *optional*, defaults to 0.0):
@@ -826,7 +810,7 @@ class StableDiffusionXLTilingPipeline(
                 [`schedulers.DDIMScheduler`], will be ignored for others.
             generator (`torch.Generator` or `List[torch.Generator]`, *optional*):
                 One or a list of [torch generator(s)](https://pytorch.org/docs/stable/generated/torch.Generator.html)
-                to make generation deterministic.                        
+                to make generation deterministic.
             output_type (`str`, *optional*, defaults to `"pil"`):
                 The output format of the generate image. Choose between
                 [PIL](https://pillow.readthedocs.io/en/stable/): `PIL.Image.Image` or `np.array`.
@@ -836,7 +820,7 @@ class StableDiffusionXLTilingPipeline(
             cross_attention_kwargs (`dict`, *optional*):
                 A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
                 `self.processor` in
-                [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).            
+                [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
             original_size (`Tuple[int]`, *optional*, defaults to (1024, 1024)):
                 If `original_size` is not the same as `target_size` the image will appear to be down- or upsampled.
                 `original_size` defaults to `(height, width)` if not specified. Part of SDXL's micro-conditioning as
@@ -881,10 +865,10 @@ class StableDiffusionXLTilingPipeline(
             seed_tiles_mode (`Union[str, List[List[str]]]`, *optional*, defaults to `"full"`):
                 Mode for seeding tiles, can be `"full"` or `"exclusive"`. If `"full"`, all the latents affected by the tile will be overridden. If `"exclusive"`, only the latents that are exclusively affected by this tile (and no other tiles) will be overridden.
             seed_reroll_regions (`List[Tuple[int, int, int, int, int]]`, *optional*):
-                A list of tuples in the form of `(start_row, end_row, start_column, end_column, seed)` defining regions in pixel space for which the latents will be overridden using the given seed. Takes priority over `seed_tiles`.           
+                A list of tuples in the form of `(start_row, end_row, start_column, end_column, seed)` defining regions in pixel space for which the latents will be overridden using the given seed. Takes priority over `seed_tiles`.
             **kwargs (`Dict[str, Any]`, *optional*):
                  Additional optional keyword arguments to be passed to the `unet.__call__` and `scheduler.step` functions.
-        
+
         Examples:
 
         Returns:
@@ -902,7 +886,7 @@ class StableDiffusionXLTilingPipeline(
 
         self._guidance_scale = guidance_scale
         self._clip_skip = clip_skip
-        self._cross_attention_kwargs = cross_attention_kwargs        
+        self._cross_attention_kwargs = cross_attention_kwargs
         self._interrupt = False
 
         grid_rows = len(prompt)
@@ -912,12 +896,12 @@ class StableDiffusionXLTilingPipeline(
 
         if isinstance(seed_tiles_mode, str):
             seed_tiles_mode = [[seed_tiles_mode for _ in range(len(row))] for row in prompt]
-               
+
         # 1. Check inputs. Raise error if not correct
         self.check_inputs(
-            prompt,            
+            prompt,
             height,
-            width,            
+            width,
             grid_cols,
             seed_tiles_mode,
             tiles_mode,
@@ -933,7 +917,7 @@ class StableDiffusionXLTilingPipeline(
         # update height and width tile size and tile overlap size
         height = tile_height + (grid_rows - 1) * (tile_height - tile_row_overlap)
         width = tile_width + (grid_cols - 1) * (tile_width - tile_col_overlap)
-               
+
         # 3. Encode input prompt
         lora_scale = (
             self.cross_attention_kwargs.get("scale", None) if self.cross_attention_kwargs is not None else None
@@ -941,11 +925,11 @@ class StableDiffusionXLTilingPipeline(
         text_embeddings = [
             [
                 self.encode_prompt(
-                    prompt=col,                    
+                    prompt=col,
                     device=device,
                     num_images_per_prompt=num_images_per_prompt,
                     do_classifier_free_guidance=self.do_classifier_free_guidance,
-                    negative_prompt=negative_prompt,                    
+                    negative_prompt=negative_prompt,
                     prompt_embeds=None,
                     negative_prompt_embeds=None,
                     pooled_prompt_embeds=None,
@@ -956,10 +940,10 @@ class StableDiffusionXLTilingPipeline(
                 for col in row
             ]
             for row in prompt
-        ]      
+        ]
 
         # 3. Prepare latents
-        latents_shape = (batch_size, self.unet.config.in_channels, height // 8, width // 8)        
+        latents_shape = (batch_size, self.unet.config.in_channels, height // 8, width // 8)
         dtype = text_embeddings[0][0][0].dtype
         latents = randn_tensor(latents_shape, generator=generator, device=device, dtype=dtype)
 
@@ -1008,7 +992,7 @@ class StableDiffusionXLTilingPipeline(
             extra_set_kwargs["offset"] = 1
         timesteps, num_inference_steps = retrieve_timesteps(
             self.scheduler, num_inference_steps, device, None, None, **extra_set_kwargs
-        ) 
+        )
 
         # if we use LMSDiscreteScheduler, let's make sure latents are multiplied by sigmas
         if isinstance(self.scheduler, LMSDiscreteScheduler):
@@ -1023,7 +1007,7 @@ class StableDiffusionXLTilingPipeline(
         for row in range(grid_rows):
             addition_embed_type_row = []
             for col in range(grid_cols):
-                #extract generated values
+                # extract generated values
                 prompt_embeds = text_embeddings[row][col][0]
                 negative_prompt_embeds = text_embeddings[row][col][1]
                 pooled_prompt_embeds = text_embeddings[row][col][2]
@@ -1051,7 +1035,7 @@ class StableDiffusionXLTilingPipeline(
                         )
                     else:
                         negative_add_time_ids = add_time_ids
-                    
+
                     if self.do_classifier_free_guidance:
                         prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
                         add_text_embeds = torch.cat([negative_pooled_prompt_embeds, add_text_embeds], dim=0)
@@ -1062,14 +1046,14 @@ class StableDiffusionXLTilingPipeline(
                     add_time_ids = add_time_ids.to(device).repeat(batch_size * num_images_per_prompt, 1)
                 addition_embed_type_row.append((prompt_embeds, add_text_embeds, add_time_ids))
             embeddings_and_added_time.append(addition_embed_type_row)
-      
+
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
 
         # 7. Mask for tile weights strength
         tile_weights = self._gaussian_weights(tile_width, tile_height, batch_size, device, torch.float32)
 
         # 8. Denoising loop
-        self._num_timesteps = len(timesteps)        
+        self._num_timesteps = len(timesteps)
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 # Diffuse each tile
@@ -1084,16 +1068,21 @@ class StableDiffusionXLTilingPipeline(
                         )
                         tile_latents = latents[:, :, px_row_init:px_row_end, px_col_init:px_col_end]
                         # expand the latents if we are doing classifier free guidance
-                        latent_model_input = torch.cat([tile_latents] * 2) if self.do_classifier_free_guidance else latents
+                        latent_model_input = (
+                            torch.cat([tile_latents] * 2) if self.do_classifier_free_guidance else tile_latents
+                        )
                         latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                         # predict the noise residual
-                        added_cond_kwargs = {"text_embeds": embeddings_and_added_time[row][col][1], "time_ids": embeddings_and_added_time[row][col][2]}
-                        with torch.amp.autocast(device.type, dtype=dtype, enabled=dtype!=self.unet.dtype):
+                        added_cond_kwargs = {
+                            "text_embeds": embeddings_and_added_time[row][col][1],
+                            "time_ids": embeddings_and_added_time[row][col][2],
+                        }
+                        with torch.amp.autocast(device.type, dtype=dtype, enabled=dtype != self.unet.dtype):
                             noise_pred = self.unet(
                                 latent_model_input,
                                 t,
-                                encoder_hidden_states=embeddings_and_added_time[row][col][0],                            
+                                encoder_hidden_states=embeddings_and_added_time[row][col][0],
                                 cross_attention_kwargs=self.cross_attention_kwargs,
                                 added_cond_kwargs=added_cond_kwargs,
                                 return_dict=False,
@@ -1110,7 +1099,7 @@ class StableDiffusionXLTilingPipeline(
                             noise_pred_tile = noise_pred_uncond + guidance * (noise_pred_text - noise_pred_uncond)
                             noise_preds_row.append(noise_pred_tile)
                     noise_preds.append(noise_preds_row)
-                
+
                 # Stitch noise predictions for all tiles
                 noise_pred = torch.zeros(latents.shape, device=device)
                 contributors = torch.zeros(latents.shape, device=device)
@@ -1140,7 +1129,7 @@ class StableDiffusionXLTilingPipeline(
 
                 # update progress bar
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
-                    progress_bar.update()                
+                    progress_bar.update()
 
                 if XLA_AVAILABLE:
                     xm.mark_step()
@@ -1173,7 +1162,7 @@ class StableDiffusionXLTilingPipeline(
                 latents = latents / self.vae.config.scaling_factor
 
             image = self.vae.decode(latents, return_dict=False)[0]
-            
+
             # cast back to fp16 if  needed
             if needs_upcasting:
                 self.vae.to(dtype=torch.float16)
@@ -1184,7 +1173,7 @@ class StableDiffusionXLTilingPipeline(
             # apply watermark if available
             if self.watermark is not None:
                 image = self.watermark.apply_watermark(image)
-            
+
             image = self.image_processor.postprocess(image, output_type=output_type)
 
         # Offload all models
@@ -1194,5 +1183,3 @@ class StableDiffusionXLTilingPipeline(
             return (image,)
 
         return StableDiffusionXLPipelineOutput(images=image)
-
-      
