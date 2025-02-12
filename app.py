@@ -32,7 +32,7 @@ pipe = StableDiffusionXLTilingPipeline.from_pretrained(
     #variant="fp16",
 ).to("cuda")
 
-#pipe.enable_model_cpu_offload() #<< Enable this if you have limited VRAM
+pipe.enable_model_cpu_offload() #<< Enable this if you have limited VRAM
 pipe.enable_vae_tiling()
 pipe.enable_vae_slicing()
 
@@ -49,6 +49,8 @@ def select_scheduler(scheduler_name):
     scheduler = getattr(diffusers, scheduler_class_name)    
     scheduler = scheduler.from_config(pipe.scheduler.config, **add_kwargs) 
     return scheduler
+
+
 
 @spaces.GPU
 def predict(left_prompt, center_prompt, right_prompt, negative_prompt, left_gs, center_gs, right_gs, overlap_pixels, steps, generation_seed, scheduler, tile_height, tile_width, target_height, target_width):
@@ -80,10 +82,9 @@ def predict(left_prompt, center_prompt, right_prompt, negative_prompt, left_gs, 
         tile_width=tile_width,
         tile_row_overlap=0,
         tile_col_overlap=overlap_pixels,        
-        guidance_scale_tiles=[[left_gs, center_gs, right_gs]],
+        guidance_scale_tiles=[[left_gs, center_gs, right_gs]],     
         height=target_height,
-        width=target_width,
-        target_size=(target_height, target_width),
+        width=target_width,               
         generator=generator,
         num_inference_steps=steps,
     )["images"][0]
@@ -185,7 +186,7 @@ css = """
 """
 title = """<h1 align="center">Mixture-of-Diffusers for SDXL Tiling Pipeline🤗</h1>           
            <div style="display: flex; flex-direction: column; justify-content: center; align-items: center; text-align: center; overflow:hidden;">
-                <span>This project implements an SDXL pipeline based on the original project, <a href='https://github.com/albarji/mixture-of-diffusers'>Mixture-of-Diffusers</a>. For more information, see the:                
+                <span>This <a href="https://github.com/DEVAIEXP/mixture-of-diffusers-sdxl-tiling">project</a> implements a SDXL tiling pipeline based on the original project: <a href='https://github.com/albarji/mixture-of-diffusers'>Mixture-of-Diffusers</a>. For more information, see the:                
                 <a href="https://arxiv.org/pdf/2408.06072">📜 paper </a>
            </div>           
            """
@@ -319,7 +320,7 @@ with gr.Blocks(css=css) as app:
                     5, 5, 5,
                     160,
                     30,
-                    1328797844,
+                    619517442,
                     "UniPCMultistepScheduler",
                     1024,
                     1280,
@@ -335,7 +336,7 @@ with gr.Blocks(css=css) as app:
                     7, 7, 7,
                     256,
                     30,
-                    297984183,
+                    358867853,
                     "DPMSolverMultistepScheduler-Karras-SDE",
                     1024,
                     1280,
