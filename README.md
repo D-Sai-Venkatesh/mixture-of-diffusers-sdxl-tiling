@@ -18,10 +18,12 @@ The **Mixture-of-Diffusers for SDXL Tiling Pipeline** strives to provide a bette
 
 
 ## Key Features
-**Multi-Area Prompt Support**
+* **Multi-Area Prompt Support**
+
 Easily input distinct descriptions for the left, center, and right regions (e.g., "a waterfall" for the left, "a plain with cattle" for the center, and "a rocky mountain" for the right). This innovative feature allows the system to seamlessly blend multiple scenes into one breathtaking panoramic image.
 
-**Advanced Tiling Technology**
+* **Advanced Tiling Technology**
+
 The project leverages a sophisticated tiling approach that intelligently manages overlapping regions, ensuring natural transitions and high-resolution panoramic outputs. This isn’t just a simple image merge—it’s a refined process designed to deliver exceptional quality and intricate detail.
 
 ## Installation
