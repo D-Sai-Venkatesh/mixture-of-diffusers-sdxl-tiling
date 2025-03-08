@@ -1,6 +1,7 @@
 torch
-spaces
+peft
 scipy
+opencv-python
 gradio==5.15.0
 numpy==1.26.4
 transformers

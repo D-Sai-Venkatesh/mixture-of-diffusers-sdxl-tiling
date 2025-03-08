@@ -1,27 +1,15 @@
 import random
 import gradio as gr
-import numpy as np
-import spaces
 import torch
 from diffusers import AutoencoderKL
-from mixture_tiling_sdxl import StableDiffusionXLTilingPipeline
+from pipeline.mixture_tiling_sdxl import StableDiffusionXLTilingPipeline
+from pipeline.util import MAX_SEED, SAMPLERS, create_hdr_effect, select_scheduler
 
-MAX_SEED = np.iinfo(np.int32).max
-SCHEDULERS = [
-                "LMSDiscreteScheduler",
-                "DEISMultistepScheduler",
-                "HeunDiscreteScheduler",
-                "EulerAncestralDiscreteScheduler",
-                "EulerDiscreteScheduler",
-                "DPMSolverMultistepScheduler",
-                "DPMSolverMultistepScheduler-Karras",
-                "DPMSolverMultistepScheduler-Karras-SDE",
-                "UniPCMultistepScheduler"
-]
+device = "cuda"
 
 vae = AutoencoderKL.from_pretrained(
     "madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float16
-).to("cuda")
+).to(device)
 
 model_id="stablediffusionapi/yamermix-v8-vae"
 pipe = StableDiffusionXLTilingPipeline.from_pretrained(
@@ -30,38 +18,40 @@ pipe = StableDiffusionXLTilingPipeline.from_pretrained(
     vae=vae,
     use_safetensors=False, #for yammermix   
     #variant="fp16",
-).to("cuda")
+).to(device)
 
 pipe.enable_model_cpu_offload() #<< Enable this if you have limited VRAM
 pipe.enable_vae_tiling()
 pipe.enable_vae_slicing()
 
 #region functions
-def select_scheduler(scheduler_name):
-    scheduler = scheduler_name.split("-")
-    scheduler_class_name = scheduler[0]
-    add_kwargs = {"beta_start": 0.00085, "beta_end": 0.012, "beta_schedule": "scaled_linear", "num_train_timesteps": 1000}
-    if len(scheduler) > 1:
-        add_kwargs["use_karras_sigmas"] = True
-    if len(scheduler) > 2:
-        add_kwargs["algorithm_type"] = "sde-dpmsolver++"
-    import diffusers
-    scheduler = getattr(diffusers, scheduler_class_name)    
-    scheduler = scheduler.from_config(pipe.scheduler.config, **add_kwargs) 
-    return scheduler
-
-
-
-@spaces.GPU
-def predict(left_prompt, center_prompt, right_prompt, negative_prompt, left_gs, center_gs, right_gs, overlap_pixels, steps, generation_seed, scheduler, tile_height, tile_width, target_height, target_width):
+def predict(
+    left_prompt,
+    center_prompt,
+    right_prompt,
+    negative_prompt,
+    left_gs,
+    center_gs,
+    right_gs,
+    overlap_pixels,
+    steps,
+    generation_seed,
+    scheduler,
+    tile_height,
+    tile_width,
+    target_height,
+    target_width,
+    hdr,
+    progress=gr.Progress(track_tqdm=True),
+):
     global pipe
     
     # Set selected scheduler
     print(f"Using scheduler: {scheduler}...")
-    pipe.scheduler = select_scheduler(scheduler)
+    pipe.scheduler = select_scheduler(pipe, scheduler)
 
     # Set seed
-    generator = torch.Generator("cuda").manual_seed(generation_seed)
+    generator = torch.Generator(device).manual_seed(generation_seed)
     
     target_height = int(target_height)
     target_width = int(target_width)
@@ -89,6 +79,7 @@ def predict(left_prompt, center_prompt, right_prompt, negative_prompt, left_gs, 
         num_inference_steps=steps,
     )["images"][0]
 
+    image = create_hdr_effect(image, hdr)
     return image
 
 def calc_tile_size(target_height, target_width, overlap_pixels, max_tile_width_size=1280):
@@ -170,8 +161,43 @@ def do_calc_tile(target_height, target_width, overlap_pixels, max_tile_size):
 def clear_result():
     return gr.update(value=None)
 
-def run_for_examples(left_prompt, center_prompt, right_prompt, negative_prompt, left_gs, center_gs, right_gs, overlap_pixels, steps, generation_seed, scheduler, tile_height, tile_width, target_height, target_width, max_tile_width):
-    return predict(left_prompt, center_prompt, right_prompt, negative_prompt, left_gs, center_gs, right_gs, overlap_pixels, steps, generation_seed, scheduler, tile_height, tile_width, target_height, target_width)
+def run_for_examples(
+    left_prompt,
+    center_prompt,
+    right_prompt,
+    negative_prompt,
+    left_gs,
+    center_gs,
+    right_gs,
+    overlap_pixels,
+    steps,
+    generation_seed,
+    scheduler,
+    tile_height,
+    tile_width,
+    target_height,
+    target_width,
+    max_tile_width,
+    hdr,
+):
+    return predict(
+        left_prompt,
+        center_prompt,
+        right_prompt,
+        negative_prompt,
+        left_gs,
+        center_gs,
+        right_gs,
+        overlap_pixels,
+        steps,
+        generation_seed,
+        scheduler,
+        tile_height,
+        tile_width,
+        target_height,
+        target_width,
+        hdr,
+    )
 
 def randomize_seed_fn(generation_seed: int, randomize_seed: bool) -> int:
     if randomize_seed:
@@ -179,9 +205,52 @@ def randomize_seed_fn(generation_seed: int, randomize_seed: bool) -> int:
     return generation_seed
 
 css = """
-.gradio-container .fillable { 
-    width: 95% !important;
+body {
+    font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+    margin: 0;
+    padding: 0;
+}
+.gradio-container {
+    border-radius: 15px;
+    padding: 30px 40px;
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.3);
+    margin: 40px 340px;
+}
+.gradio-container h1 {
+    text-shadow: 1px 1px 2px rgba(0, 0, 0, 0.2);
+}
+.fillable {
+    width: 100% !important;
     max-width: unset !important;
+}
+#examples_container {
+    margin: auto;
+    width: 90%;
+}
+#examples_row {
+    justify-content: center;
+}
+#tips_row{
+    padding-left: 20px;
+}
+.sidebar {
+    border-radius: 10px;
+    padding: 10px;
+    box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+}
+.sidebar .toggle-button {
+    background: linear-gradient(90deg, #fbbf24, #fcd34d) !important;
+    border: none;
+    padding: 12px 24px;
+    text-transform: uppercase;
+    font-weight: bold;
+    letter-spacing: 1px;
+    border-radius: 5px;
+    cursor: pointer;
+    transition: transform 0.2s ease-in-out;
+}
+.toggle-button:hover {
+    transform: scale(1.05);
 }
 """
 title = """<h1 align="center">Mixture-of-Diffusers for SDXL Tiling Pipeline🤗</h1>           
@@ -212,7 +281,7 @@ about = """
 If you have any questions or suggestions, feel free to send your question to <b>contact@devaiexp.com</b>.
 """
 
-with gr.Blocks(css=css) as app:
+with gr.Blocks(css=css, theme=gr.themes.Citrus()) as app:
     gr.Markdown(title)    
     with gr.Row():
         with gr.Column(scale=7):
@@ -304,10 +373,11 @@ with gr.Blocks(css=css) as app:
                                         value=0)
             randomize_seed = gr.Checkbox(label="Randomize seed", value=False)        
         with gr.Row():
+            hdr = gr.Slider(minimum=0, maximum=1, value=0, step=0.1, label="HDR Effect")
             scheduler = gr.Dropdown(
-                label="Schedulers",
-                choices=SCHEDULERS,
-                value=SCHEDULERS[0],
+                label="Sampler",
+                choices=list(SAMPLERS.keys()),
+                value="UniPC",
             )
     with gr.Row():
         gr.Examples(
@@ -317,81 +387,114 @@ with gr.Blocks(css=css) as app:
                     "Captain America charging forward, vibranium shield deflecting energy blasts in destroyed cityscape, collapsing buildings, rubble streets, battle-damaged suit, determined expression, distant explosions, cinematic composition, realistic rendering. Focus: Captain America.",
                     "Thor wielding Stormbreaker in destroyed cityscape, lightning crackling, powerful strike downwards, shattered buildings, burning debris, ground trembling, Asgardian armor, cinematic photography, realistic details. Focus: Thor.",
                     negative_prompt.value,
-                    5, 5, 5,
+                    5,
+                    5,
+                    5,
                     160,
                     30,
                     619517442,
-                    "UniPCMultistepScheduler",
+                    "UniPC",
                     1024,
                     1280,
-                    1024,                       
+                    1024,
                     3840,
-                    1024
+                    1024,
+                    0,
                 ],
                 [
                     "A charming house in the countryside, by jakub rozalski, sunset lighting, elegant, highly detailed, smooth, sharp focus, artstation, stunning masterpiece",
                     "A dirt road in the countryside crossing pastures, by jakub rozalski, sunset lighting, elegant, highly detailed, smooth, sharp focus, artstation, stunning masterpiece",
                     "An old and rusty giant robot lying on a dirt road, by jakub rozalski, dark sunset lighting, elegant, highly detailed, smooth, sharp focus, artstation, stunning masterpiece",
                     negative_prompt.value,
-                    7, 7, 7,
+                    7,
+                    7,
+                    7,
                     256,
                     30,
                     358867853,
-                    "DPMSolverMultistepScheduler-Karras-SDE",
+                    "DPM++ 3M Karras",
                     1024,
                     1280,
-                    1024,                       
+                    1024,
                     3840,
-                    1280
+                    1280,
+                    0,
                 ],
                 [
                     "Abstract decorative illustration, by joan miro and gustav klimt and marlina vera and loish, elegant, intricate, highly detailed, smooth, sharp focus, vibrant colors, artstation, stunning masterpiece",
                     "Abstract decorative illustration, by joan miro and gustav klimt and marlina vera and loish, elegant, intricate, highly detailed, smooth, sharp focus, vibrant colors, artstation, stunning masterpiece",
                     "Abstract decorative illustration, by joan miro and gustav klimt and marlina vera and loish, elegant, intricate, highly detailed, smooth, sharp focus, vibrant colors, artstation, stunning masterpiece",
                     negative_prompt.value,
-                    7, 7, 7,
+                    7,
+                    7,
+                    7,
                     128,
                     30,
                     580541206,
-                    "LMSDiscreteScheduler",
+                    "LMS",
                     1024,
                     768,
-                    1024,     
+                    1024,
                     2048,
-                    1280
+                    1280,
+                    0,
                 ],
                 [
                     "Magical diagrams and runes written with chalk on a blackboard, elegant, intricate, highly detailed, smooth, sharp focus, artstation, stunning masterpiece",
                     "Magical diagrams and runes written with chalk on a blackboard, elegant, intricate, highly detailed, smooth, sharp focus, artstation, stunning masterpiece",
                     "Magical diagrams and runes written with chalk on a blackboard, elegant, intricate, highly detailed, smooth, sharp focus, artstation, stunning masterpiece",
                     negative_prompt.value,
-                    9, 9, 9,
+                    9,
+                    9,
+                    9,
                     128,
                     30,
                     12591765619,
-                    "LMSDiscreteScheduler",
+                    "LMS",
                     1024,
                     768,
-                    1024,                                        
+                    1024,
                     2048,
-                    1280
-                ]
+                    1280,
+                    0,
+                ],
             ],
-            inputs=[left_prompt, center_prompt, right_prompt, negative_prompt, left_gs, center_gs, right_gs, overlap, steps, generation_seed, scheduler, tile_height, tile_width, height, width, max_tile_size],
+            inputs=[
+                left_prompt,
+                center_prompt,
+                right_prompt,
+                negative_prompt,
+                left_gs,
+                center_gs,
+                right_gs,
+                overlap,
+                steps,
+                generation_seed,
+                scheduler,
+                tile_height,
+                tile_width,
+                height,
+                width,
+                max_tile_size,
+                hdr,
+            ],
             fn=run_for_examples,
             outputs=result,
-            cache_examples=True
+            cache_examples=False,
         )
        
-    event_calc_tile_size={"fn": do_calc_tile, "inputs":[height, width, overlap, max_tile_size], "outputs":[tile_height, tile_width, new_target_height, new_target_width]}
+    event_calc_tile_size = {
+        "fn": do_calc_tile,
+        "inputs": [height, width, overlap, max_tile_size],
+        "outputs": [tile_height, tile_width, new_target_height, new_target_width],
+    }
     calc_tile.click(**event_calc_tile_size)
     
     generate_button.click(
         fn=clear_result,
         inputs=None,
         outputs=result,
-    ).then(**event_calc_tile_size
-    ).then(                        
+    ).then(**event_calc_tile_size).then(
         fn=randomize_seed_fn,
         inputs=[generation_seed, randomize_seed],
         outputs=generation_seed,
@@ -399,7 +502,24 @@ with gr.Blocks(css=css) as app:
         api_name=False,
     ).then(
         fn=predict,
-        inputs=[left_prompt, center_prompt, right_prompt, negative_prompt, left_gs, center_gs, right_gs, overlap, steps, generation_seed, scheduler, tile_height, tile_width, new_target_height, new_target_width],
+        inputs=[
+            left_prompt,
+            center_prompt,
+            right_prompt,
+            negative_prompt,
+            left_gs,
+            center_gs,
+            right_gs,
+            overlap,
+            steps,
+            generation_seed,
+            scheduler,
+            tile_height,
+            tile_width,
+            new_target_height,
+            new_target_width,
+            hdr,
+        ],
         outputs=result,
     )
     gr.Markdown(about)
