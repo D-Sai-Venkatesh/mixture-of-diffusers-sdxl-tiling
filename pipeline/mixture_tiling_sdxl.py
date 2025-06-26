@@ -699,7 +699,7 @@ class StableDiffusionXLTilingPipeline(
             exp(-(x - midpoint) * (x - midpoint) / (latent_width * latent_width) / (2 * var)) / sqrt(2 * pi * var)
             for x in range(latent_width)
         ]
-        midpoint = latent_height / 2
+        midpoint = (latent_height - 1) / 2
         y_probs = [
             exp(-(y - midpoint) * (y - midpoint) / (latent_height * latent_height) / (2 * var)) / sqrt(2 * pi * var)
             for y in range(latent_height)
