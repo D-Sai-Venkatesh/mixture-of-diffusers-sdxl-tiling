@@ -814,6 +814,7 @@ class StableDiffusionXLTilingPipeline(
         seed_tiles: Optional[List[List[int]]] = None,
         seed_tiles_mode: Optional[Union[str, List[List[str]]]] = "full",
         seed_reroll_regions: Optional[List[Tuple[int, int, int, int, int]]] = None,
+        seamless_overlap: Optional[int] = 0,
         **kwargs,
     ):
         r"""
@@ -1165,7 +1166,22 @@ class StableDiffusionXLTilingPipeline(
                         contributors[:, :, px_row_init:px_row_end, px_col_init:px_col_end] += tile_weights
 
                 # Average overlapping areas with more than 1 contributor
+                if seamless_overlap is not None and seamless_overlap > 0 :
+                    n1 = noise_pred[:, :, :, :seamless_overlap]
+                    n2 = noise_pred[:, :, :, -seamless_overlap:]                    
+
+                    c1 = contributors[:, :, :, :seamless_overlap]
+                    c2 = contributors[:, :, :, -seamless_overlap:]
+
+                    noise_pred[:, :, :, :seamless_overlap] += n2
+                    noise_pred[:, :, :, -seamless_overlap:] += n1
+
+                    contributors[:, :, :, :seamless_overlap] += c2
+                    contributors[:, :, :, -seamless_overlap:] += c1
+
+
                 noise_pred /= contributors
+
                 noise_pred = noise_pred.to(dtype)
 
                 # compute the previous noisy sample x_t -> x_t-1
