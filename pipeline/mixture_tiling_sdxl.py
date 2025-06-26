@@ -179,15 +179,20 @@ def _get_crops_coords_list(num_rows, num_cols, output_width):
     """
     crops_coords_list = []
     if num_cols <= 0:
-        crops_coords_list = [] 
+        # If there are no columns, return an empty list.
+        crops_coords_list = []
     elif num_cols == 1:
+        # If there is only one column, the crop is at the top-left corner.
         crops_coords_list = [(0, 0)]
     else:
+        # Calculate the width of each section for horizontal focus.
         section_width = output_width / num_cols
         for i in range(num_cols):
-            cleft = int(round(i * section_width)) 
+            # Calculate the left coordinate for each crop.
+            cleft = int(round(i * section_width))
             crops_coords_list.append((0, cleft))
 
+    # Repeat the list of horizontal focus coordinates for each row.
     result_list = []
     for _ in range(num_rows):
         result_list.append(list(crops_coords_list))
@@ -452,7 +457,7 @@ class StableDiffusionXLTilingPipeline(
         if lora_scale is not None and isinstance(self, StableDiffusionXLLoraLoaderMixin):
             self._lora_scale = lora_scale
 
-            # dynamically adjust the LoRA scale
+            # dynamically adjust the LoRA scale for both text encoders
             if self.text_encoder is not None:
                 if not USE_PEFT_BACKEND:
                     adjust_lora_scale_text_encoder(self.text_encoder, lora_scale)
@@ -465,6 +470,7 @@ class StableDiffusionXLTilingPipeline(
                 else:
                     scale_lora_layers(self.text_encoder_2, lora_scale)
 
+        # Ensure prompt is a list
         prompt = [prompt] if isinstance(prompt, str) else prompt
 
         if prompt is not None:
@@ -472,7 +478,7 @@ class StableDiffusionXLTilingPipeline(
         else:
             batch_size = prompt_embeds.shape[0]
 
-        # Define tokenizers and text encoders
+        # Define tokenizers and text encoders to use. SDXL uses two.
         tokenizers = [self.tokenizer, self.tokenizer_2] if self.tokenizer is not None else [self.tokenizer_2]
         text_encoders = (
             [self.text_encoder, self.text_encoder_2] if self.text_encoder is not None else [self.text_encoder_2]
@@ -485,10 +491,12 @@ class StableDiffusionXLTilingPipeline(
             # textual inversion: process multi-vector tokens if necessary
             prompt_embeds_list = []
             prompts = [prompt, prompt_2]
+            # Process prompts with their corresponding tokenizers and text encoders
             for prompt, tokenizer, text_encoder in zip(prompts, tokenizers, text_encoders):
                 if isinstance(self, TextualInversionLoaderMixin):
                     prompt = self.maybe_convert_prompt(prompt, tokenizer)
 
+                # Tokenize the prompt
                 text_inputs = tokenizer(
                     prompt,
                     padding="max_length",
@@ -498,6 +506,7 @@ class StableDiffusionXLTilingPipeline(
                 )
 
                 text_input_ids = text_inputs.input_ids
+                # Check for and warn about truncated prompts
                 untruncated_ids = tokenizer(prompt, padding="longest", return_tensors="pt").input_ids
 
                 if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(
@@ -509,12 +518,14 @@ class StableDiffusionXLTilingPipeline(
                         f" {tokenizer.model_max_length} tokens: {removed_text}"
                     )
 
+                # Get prompt embeddings from the text encoder
                 prompt_embeds = text_encoder(text_input_ids.to(device), output_hidden_states=True)
 
-                # We are only ALWAYS interested in the pooled output of the final text encoder
+                # We are only ALWAYS interested in the pooled output of the final text encoder (text_encoder_2)
                 if pooled_prompt_embeds is None and prompt_embeds[0].ndim == 2:
                     pooled_prompt_embeds = prompt_embeds[0]
 
+                # Handle clip_skip. If None, use the penultimate layer's hidden state.
                 if clip_skip is None:
                     prompt_embeds = prompt_embeds.hidden_states[-2]
                 else:
@@ -523,14 +534,17 @@ class StableDiffusionXLTilingPipeline(
 
                 prompt_embeds_list.append(prompt_embeds)
 
+            # Concatenate the embeddings from both text encoders
             prompt_embeds = torch.concat(prompt_embeds_list, dim=-1)
 
         # get unconditional embeddings for classifier free guidance
         zero_out_negative_prompt = negative_prompt is None and self.config.force_zeros_for_empty_prompt
         if do_classifier_free_guidance and negative_prompt_embeds is None and zero_out_negative_prompt:
+            # Create zeroed embeddings for empty negative prompts
             negative_prompt_embeds = torch.zeros_like(prompt_embeds)
             negative_pooled_prompt_embeds = torch.zeros_like(pooled_prompt_embeds)
         elif do_classifier_free_guidance and negative_prompt_embeds is None:
+            # Process negative prompts if they are provided
             negative_prompt = negative_prompt or ""
             negative_prompt_2 = negative_prompt_2 or negative_prompt
 
@@ -555,6 +569,7 @@ class StableDiffusionXLTilingPipeline(
             else:
                 uncond_tokens = [negative_prompt, negative_prompt_2]
 
+            # Generate negative prompt embeddings
             negative_prompt_embeds_list = []
             for negative_prompt, tokenizer, text_encoder in zip(uncond_tokens, tokenizers, text_encoders):
                 if isinstance(self, TextualInversionLoaderMixin):
@@ -577,24 +592,27 @@ class StableDiffusionXLTilingPipeline(
                 # We are only ALWAYS interested in the pooled output of the final text encoder
                 if negative_pooled_prompt_embeds is None and negative_prompt_embeds[0].ndim == 2:
                     negative_pooled_prompt_embeds = negative_prompt_embeds[0]
+                # Use the penultimate layer's hidden state for negative prompt embeddings
                 negative_prompt_embeds = negative_prompt_embeds.hidden_states[-2]
 
                 negative_prompt_embeds_list.append(negative_prompt_embeds)
 
+            # Concatenate negative embeddings from both encoders
             negative_prompt_embeds = torch.concat(negative_prompt_embeds_list, dim=-1)
 
+        # Set the correct dtype for the embeddings
         if self.text_encoder_2 is not None:
             prompt_embeds = prompt_embeds.to(dtype=self.text_encoder_2.dtype, device=device)
         else:
             prompt_embeds = prompt_embeds.to(dtype=self.unet.dtype, device=device)
 
         bs_embed, seq_len, _ = prompt_embeds.shape
-        # duplicate text embeddings for each generation per prompt, using mps friendly method
+        # duplicate text embeddings for each generation per prompt
         prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
         prompt_embeds = prompt_embeds.view(bs_embed * num_images_per_prompt, seq_len, -1)
 
         if do_classifier_free_guidance:
-            # duplicate unconditional embeddings for each generation per prompt, using mps friendly method
+            # duplicate unconditional embeddings for each generation per prompt
             seq_len = negative_prompt_embeds.shape[1]
 
             if self.text_encoder_2 is not None:
@@ -605,6 +623,7 @@ class StableDiffusionXLTilingPipeline(
             negative_prompt_embeds = negative_prompt_embeds.repeat(1, num_images_per_prompt, 1)
             negative_prompt_embeds = negative_prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
 
+        # duplicate pooled embeddings
         pooled_prompt_embeds = pooled_prompt_embeds.repeat(1, num_images_per_prompt).view(
             bs_embed * num_images_per_prompt, -1
         )
@@ -613,6 +632,7 @@ class StableDiffusionXLTilingPipeline(
                 bs_embed * num_images_per_prompt, -1
             )
 
+        # Unscale LoRA layers if they were scaled
         if self.text_encoder is not None:
             if isinstance(self, StableDiffusionXLLoraLoaderMixin) and USE_PEFT_BACKEND:
                 # Retrieve the original scale by scaling back the LoRA layers
@@ -644,29 +664,36 @@ class StableDiffusionXLTilingPipeline(
         return extra_step_kwargs
 
     def check_inputs(self, prompt, height, width, grid_cols, seed_tiles_mode, tiles_mode):
+        # Ensure image dimensions are divisible by 8, a requirement for the VAE.
         if height % 8 != 0 or width % 8 != 0:
             raise ValueError(f"`height` and `width` have to be divisible by 8 but are {height} and {width}.")
 
+        # Validate the prompt format.
         if prompt is not None and (not isinstance(prompt, str) and not isinstance(prompt, list)):
             raise ValueError(f"`prompt` has to be of type `str` or `list` but is {type(prompt)}")
 
+        # For tiling, the prompt must be a list of lists (a grid of prompts).
         if not isinstance(prompt, list) or not all(isinstance(row, list) for row in prompt):
             raise ValueError(f"`prompt` has to be a list of lists but is {type(prompt)}")
 
+        # All rows in the prompt grid must have the same number of columns.
         if not all(len(row) == grid_cols for row in prompt):
             raise ValueError("All prompt rows must have the same number of prompt columns")
 
+        # Validate the seed_tiles_mode format.
         if not isinstance(seed_tiles_mode, str) and (
             not isinstance(seed_tiles_mode, list) or not all(isinstance(row, list) for row in seed_tiles_mode)
         ):
             raise ValueError(f"`seed_tiles_mode` has to be a string or list of lists but is {type(prompt)}")
 
+        # Ensure all specified seed tile modes are valid.
         if any(mode not in tiles_mode for row in seed_tiles_mode for mode in row):
             raise ValueError(f"Seed tiles mode must be one of {tiles_mode}")
 
     def _get_add_time_ids(
         self, original_size, crops_coords_top_left, target_size, dtype, text_encoder_projection_dim=None
     ):
+        # Part of SDXL's micro-conditioning, encodes image size and crop information.
         add_time_ids = list(original_size + crops_coords_top_left + target_size)
 
         passed_add_embed_dim = (
@@ -674,6 +701,7 @@ class StableDiffusionXLTilingPipeline(
         )
         expected_add_embed_dim = self.unet.add_embedding.linear_1.in_features
 
+        # Validate the dimensions of the added time embedding.
         if expected_add_embed_dim != passed_add_embed_dim:
             raise ValueError(
                 f"Model expects an added time embedding vector of length {expected_add_embed_dim}, but a vector of {passed_add_embed_dim} was created. The model has an incorrect config. Please check `unet.config.time_embedding_type` and `text_encoder_2.config.projection_dim`."
@@ -687,24 +715,29 @@ class StableDiffusionXLTilingPipeline(
         import numpy as np
         from numpy import exp, pi, sqrt
 
+        # Convert tile dimensions from pixel space to latent space.
         latent_width = tile_width // 8
         latent_height = tile_height // 8
 
+        # Create a 1D Gaussian distribution for width.
         var = 0.01
         midpoint = (latent_width - 1) / 2  # -1 because index goes from 0 to latent_width - 1
         x_probs = [
             exp(-(x - midpoint) * (x - midpoint) / (latent_width * latent_width) / (2 * var)) / sqrt(2 * pi * var)
             for x in range(latent_width)
         ]
+        # Create a 1D Gaussian distribution for height.
         midpoint = latent_height / 2
         y_probs = [
             exp(-(y - midpoint) * (y - midpoint) / (latent_height * latent_height) / (2 * var)) / sqrt(2 * pi * var)
             for y in range(latent_height)
         ]
 
+        # Create a 2D Gaussian mask by taking the outer product.
         weights_np = np.outer(y_probs, x_probs)
         weights_torch = torch.tensor(weights_np, device=device)
         weights_torch = weights_torch.to(dtype)
+        # Tile the mask to match the batch size and number of channels.
         return torch.tile(weights_torch, (nbatches, self.unet.config.in_channels, 1, 1))
 
     def upcast_vae(self):
@@ -814,6 +847,8 @@ class StableDiffusionXLTilingPipeline(
         seed_tiles: Optional[List[List[int]]] = None,
         seed_tiles_mode: Optional[Union[str, List[List[str]]]] = "full",
         seed_reroll_regions: Optional[List[Tuple[int, int, int, int, int]]] = None,
+        tile_row_wrap_around: bool = False, # <<< ADD THIS LINE
+        tile_col_wrap_around: bool = False, # <<< ADD THIS LINE
         **kwargs,
     ):
         r"""
@@ -924,20 +959,24 @@ class StableDiffusionXLTilingPipeline(
         height = height or self.default_sample_size * self.vae_scale_factor
         width = width or self.default_sample_size * self.vae_scale_factor
 
+        # Set up SDXL micro-conditioning variables
         original_size = original_size or (height, width)
         target_size = target_size or (height, width)
         negative_original_size = negative_original_size or (height, width)
         negative_target_size = negative_target_size or (height, width)
 
+        # Set pipeline properties
         self._guidance_scale = guidance_scale
         self._clip_skip = clip_skip
         self._cross_attention_kwargs = cross_attention_kwargs
         self._interrupt = False
 
+        # Get grid dimensions from the prompt structure
         grid_rows = len(prompt)
-        grid_cols = len(prompt[0])        
+        grid_cols = len(prompt[0])
         tiles_mode = [mode.value for mode in self.SeedTilesMode]
 
+        # If seed_tiles_mode is a single string, apply it to all tiles
         if isinstance(seed_tiles_mode, str):
             seed_tiles_mode = [[seed_tiles_mode for _ in range(len(row))] for row in prompt]
 
@@ -957,17 +996,17 @@ class StableDiffusionXLTilingPipeline(
         batch_size = 1
 
         device = self._execution_device
-        
-        # update crops coords list
-        crops_coords_top_left =  _get_crops_coords_list(grid_rows, grid_cols, tile_width)
+
+        # 2. Prepare micro-conditioning crops coordinates for each tile
+        crops_coords_top_left = _get_crops_coords_list(grid_rows, grid_cols, tile_width)
         if negative_original_size is not None and negative_target_size is not None:
             negative_crops_coords_top_left = _get_crops_coords_list(grid_rows, grid_cols, tile_width)
 
-        # update height and width tile size and tile overlap size
+        # Calculate the final image dimensions based on tile size, count, and overlap
         height = tile_height + (grid_rows - 1) * (tile_height - tile_row_overlap)
         width = tile_width + (grid_cols - 1) * (tile_width - tile_col_overlap)
 
-        # 3. Encode input prompt
+        # 3. Encode input prompt for each tile in the grid
         lora_scale = (
             self.cross_attention_kwargs.get("scale", None) if self.cross_attention_kwargs is not None else None
         )
@@ -991,22 +1030,26 @@ class StableDiffusionXLTilingPipeline(
             for row in prompt
         ]
 
-        # 3. Prepare latents
+        # 4. Prepare latents
+        # Create initial random noise for the entire image canvas
         latents_shape = (batch_size, self.unet.config.in_channels, height // 8, width // 8)
         dtype = text_embeddings[0][0][0].dtype
         latents = randn_tensor(latents_shape, generator=generator, device=device, dtype=dtype)
 
-        # 3.1 overwrite latents for specific tiles if provided
+        # 4.1 Overwrite latents for specific tiles if `seed_tiles` is provided
         if seed_tiles is not None:
             for row in range(grid_rows):
                 for col in range(grid_cols):
                     if (seed_tile := seed_tiles[row][col]) is not None:
                         mode = seed_tiles_mode[row][col]
+                        # Determine the region to re-seed based on the mode
                         if mode == self.SeedTilesMode.FULL.value:
+                            # 'full' mode re-seeds the entire tile region, including overlaps
                             row_init, row_end, col_init, col_end = _tile2latent_indices(
                                 row, col, tile_width, tile_height, tile_row_overlap, tile_col_overlap
                             )
                         else:
+                            # 'exclusive' mode re-seeds only the part of the tile not overlapping with others
                             row_init, row_end, col_init, col_end = _tile2latent_exclusive_indices(
                                 row,
                                 col,
@@ -1017,24 +1060,27 @@ class StableDiffusionXLTilingPipeline(
                                 grid_rows,
                                 grid_cols,
                             )
+                        # Generate new noise for the tile region with the specified seed
                         tile_generator = torch.Generator(device).manual_seed(seed_tile)
                         tile_shape = (latents_shape[0], latents_shape[1], row_end - row_init, col_end - col_init)
                         latents[:, :, row_init:row_end, col_init:col_end] = torch.randn(
                             tile_shape, generator=tile_generator, device=device
                         )
 
-        # 3.2 overwrite again for seed reroll regions
+        # 4.2 Overwrite again for `seed_reroll_regions`, which takes priority
         for row_init, row_end, col_init, col_end, seed_reroll in seed_reroll_regions:
+            # Convert pixel-space coordinates to latent-space coordinates
             row_init, row_end, col_init, col_end = _pixel2latent_indices(
                 row_init, row_end, col_init, col_end
-            )  # to latent space coordinates
+            )
+            # Generate new noise for the specified region with its seed
             reroll_generator = torch.Generator(device).manual_seed(seed_reroll)
             region_shape = (latents_shape[0], latents_shape[1], row_end - row_init, col_end - col_init)
             latents[:, :, row_init:row_end, col_init:col_end] = torch.randn(
                 region_shape, generator=reroll_generator, device=device
             )
 
-        # 4. Prepare timesteps
+        # 5. Prepare timesteps
         accepts_offset = "offset" in set(inspect.signature(self.scheduler.set_timesteps).parameters.keys())
         extra_set_kwargs = {}
         if accepts_offset:
@@ -1043,20 +1089,20 @@ class StableDiffusionXLTilingPipeline(
             self.scheduler, num_inference_steps, device, None, None, **extra_set_kwargs
         )
 
-        # if we use LMSDiscreteScheduler, let's make sure latents are multiplied by sigmas
+        # if we use LMSDiscreteScheduler, latents need to be scaled by sigmas
         if isinstance(self.scheduler, LMSDiscreteScheduler):
             latents = latents * self.scheduler.sigmas[0]
 
-        # 5. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
+        # 6. Prepare extra step kwargs.
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
-        # 6. Prepare added time ids & embeddings
+        # 7. Prepare added time ids & embeddings for each tile
         # text_embeddings order: prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds
         embeddings_and_added_time = []
         for row in range(grid_rows):
             addition_embed_type_row = []
             for col in range(grid_cols):
-                # extract generated values
+                # Extract pre-generated embeddings for the current tile
                 prompt_embeds = text_embeddings[row][col][0]
                 negative_prompt_embeds = text_embeddings[row][col][1]
                 pooled_prompt_embeds = text_embeddings[row][col][2]
@@ -1064,9 +1110,11 @@ class StableDiffusionXLTilingPipeline(
 
                 add_text_embeds = pooled_prompt_embeds
                 if self.text_encoder_2 is None:
+                    # Get the projection dimension from the text encoder
                     text_encoder_projection_dim = int(pooled_prompt_embeds.shape[-1])
                 else:
                     text_encoder_projection_dim = self.text_encoder_2.config.projection_dim
+                # Get the added time IDs for positive conditioning
                 add_time_ids = self._get_add_time_ids(
                     original_size,
                     crops_coords_top_left[row][col],
@@ -1074,6 +1122,7 @@ class StableDiffusionXLTilingPipeline(
                     dtype=prompt_embeds.dtype,
                     text_encoder_projection_dim=text_encoder_projection_dim,
                 )
+                # Get the added time IDs for negative conditioning
                 if negative_original_size is not None and negative_target_size is not None:
                     negative_add_time_ids = self._get_add_time_ids(
                         negative_original_size,
@@ -1085,6 +1134,7 @@ class StableDiffusionXLTilingPipeline(
                 else:
                     negative_add_time_ids = add_time_ids
 
+                # Concatenate embeddings for classifier-free guidance
                 if self.do_classifier_free_guidance:
                     prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
                     add_text_embeds = torch.cat([negative_pooled_prompt_embeds, add_text_embeds], dim=0)
@@ -1098,31 +1148,39 @@ class StableDiffusionXLTilingPipeline(
 
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
 
-        # 7. Mask for tile weights strength
+        # 8. Mask for tile weights strength
+        # This creates a Gaussian-weighted mask to blend the tiles smoothly.
         tile_weights = self._gaussian_weights(tile_width, tile_height, batch_size, device, torch.float32)
 
-        # 8. Denoising loop
+        # 9. Denoising loop
         self._num_timesteps = len(timesteps)
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
-                # Diffuse each tile
+                # 9.1 Diffuse each tile individually
+                if tile_row_wrap_around:
+                    latents = torch.roll(latents, shifts=tile_row_overlap // self.vae_scale_factor, dims=2)
+                if tile_col_wrap_around:
+                    latents = torch.roll(latents, shifts=tile_col_overlap // self.vae_scale_factor, dims=3)
+
                 noise_preds = []
                 for row in range(grid_rows):
                     noise_preds_row = []
                     for col in range(grid_cols):
                         if self.interrupt:
                             continue
+                        # Get the latent region for the current tile
                         px_row_init, px_row_end, px_col_init, px_col_end = _tile2latent_indices(
                             row, col, tile_width, tile_height, tile_row_overlap, tile_col_overlap
                         )
                         tile_latents = latents[:, :, px_row_init:px_row_end, px_col_init:px_col_end]
-                        # expand the latents if we are doing classifier free guidance
+                        
+                        # Expand the latents if we are doing classifier free guidance
                         latent_model_input = (
                             torch.cat([tile_latents] * 2) if self.do_classifier_free_guidance else tile_latents
                         )
                         latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
-                        # predict the noise residual
+                        # Predict the noise residual for the tile
                         added_cond_kwargs = {
                             "text_embeds": embeddings_and_added_time[row][col][1],
                             "time_ids": embeddings_and_added_time[row][col][2],
@@ -1140,6 +1198,7 @@ class StableDiffusionXLTilingPipeline(
                         # perform guidance
                         if self.do_classifier_free_guidance:
                             noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                            # Use tile-specific guidance scale if provided, otherwise use the global one
                             guidance = (
                                 guidance_scale
                                 if guidance_scale_tiles is None or guidance_scale_tiles[row][col] is None
@@ -1149,26 +1208,34 @@ class StableDiffusionXLTilingPipeline(
                             noise_preds_row.append(noise_pred_tile)
                     noise_preds.append(noise_preds_row)
 
-                # Stitch noise predictions for all tiles
+                # 9.2 Stitch noise predictions for all tiles
                 noise_pred = torch.zeros(latents.shape, device=device)
                 contributors = torch.zeros(latents.shape, device=device)
 
-                # Add each tile contribution to overall latents
+                # Add each tile's weighted contribution to the overall noise prediction
                 for row in range(grid_rows):
                     for col in range(grid_cols):
                         px_row_init, px_row_end, px_col_init, px_col_end = _tile2latent_indices(
                             row, col, tile_width, tile_height, tile_row_overlap, tile_col_overlap
                         )
+                        # Add the weighted noise prediction
                         noise_pred[:, :, px_row_init:px_row_end, px_col_init:px_col_end] += (
                             noise_preds[row][col] * tile_weights
                         )
+                        # Keep track of the sum of weights for averaging
                         contributors[:, :, px_row_init:px_row_end, px_col_init:px_col_end] += tile_weights
 
-                # Average overlapping areas with more than 1 contributor
+                # Average the noise in overlapping areas by dividing by the sum of weights
                 noise_pred /= contributors
+
+                if tile_row_wrap_around:
+                    noise_pred = torch.roll(noise_pred, shifts=-tile_row_overlap // self.vae_scale_factor, dims=2)
+                if tile_col_wrap_around:
+                    noise_pred = torch.roll(noise_pred, shifts=-tile_col_overlap // self.vae_scale_factor, dims=3)
+
                 noise_pred = noise_pred.to(dtype)
 
-                # compute the previous noisy sample x_t -> x_t-1
+                # 9.3 Compute the previous noisy sample x_t -> x_t-1
                 latents_dtype = latents.dtype
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
                 if latents.dtype != latents_dtype:
@@ -1183,6 +1250,7 @@ class StableDiffusionXLTilingPipeline(
                 if XLA_AVAILABLE:
                     xm.mark_step()
 
+        # 10. Post-processing
         if not output_type == "latent":
             # make sure the VAE is in float32 mode, as it overflows in float16
             needs_upcasting = self.vae.dtype == torch.float16 and self.vae.config.force_upcast
@@ -1196,7 +1264,6 @@ class StableDiffusionXLTilingPipeline(
                     self.vae = self.vae.to(latents.dtype)
 
             # unscale/denormalize the latents
-            # denormalize with the mean and std if available and not None
             has_latents_mean = hasattr(self.vae.config, "latents_mean") and self.vae.config.latents_mean is not None
             has_latents_std = hasattr(self.vae.config, "latents_std") and self.vae.config.latents_std is not None
             if has_latents_mean and has_latents_std:
@@ -1210,6 +1277,7 @@ class StableDiffusionXLTilingPipeline(
             else:
                 latents = latents / self.vae.config.scaling_factor
 
+            # Decode the latents into an image
             image = self.vae.decode(latents, return_dict=False)[0]
 
             # cast back to fp16 if  needed
