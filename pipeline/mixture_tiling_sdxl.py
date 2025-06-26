@@ -643,7 +643,7 @@ class StableDiffusionXLTilingPipeline(
             extra_step_kwargs["generator"] = generator
         return extra_step_kwargs
 
-    def check_inputs(self, prompt, height, width, grid_cols, seed_tiles_mode, tiles_mode):
+    def check_inputs(self, prompt, height, width, grid_cols, seed_tiles_mode, tiles_mode, tile_col_overflow):
         if height % 8 != 0 or width % 8 != 0:
             raise ValueError(f"`height` and `width` have to be divisible by 8 but are {height} and {width}.")
 
@@ -663,6 +663,9 @@ class StableDiffusionXLTilingPipeline(
 
         if any(mode not in tiles_mode for row in seed_tiles_mode for mode in row):
             raise ValueError(f"Seed tiles mode must be one of {tiles_mode}")
+
+        if not isinstance(tile_col_overflow, bool):
+            raise ValueError(f"`tile_col_overflow` has to be of type `bool` but is {type(tile_col_overflow)}")
 
     def _get_add_time_ids(
         self, original_size, crops_coords_top_left, target_size, dtype, text_encoder_projection_dim=None
@@ -814,6 +817,7 @@ class StableDiffusionXLTilingPipeline(
         seed_tiles: Optional[List[List[int]]] = None,
         seed_tiles_mode: Optional[Union[str, List[List[str]]]] = "full",
         seed_reroll_regions: Optional[List[Tuple[int, int, int, int, int]]] = None,
+        tile_col_overflow: bool = False,
         **kwargs,
     ):
         r"""
@@ -909,6 +913,8 @@ class StableDiffusionXLTilingPipeline(
                 Mode for seeding tiles, can be `"full"` or `"exclusive"`. If `"full"`, all the latents affected by the tile will be overridden. If `"exclusive"`, only the latents that are exclusively affected by this tile (and no other tiles) will be overridden.
             seed_reroll_regions (`List[Tuple[int, int, int, int, int]]`, *optional*):
                 A list of tuples in the form of `(start_row, end_row, start_column, end_column, seed)` defining regions in pixel space for which the latents will be overridden using the given seed. Takes priority over `seed_tiles`.
+            tile_col_overflow (`bool`, *optional*, defaults to `False`):
+                If `True`, the tiling will wrap around horizontally, creating a seamless image.
             **kwargs (`Dict[str, Any]`, *optional*):
                  Additional optional keyword arguments to be passed to the `unet.__call__` and `scheduler.step` functions.
 
@@ -949,6 +955,7 @@ class StableDiffusionXLTilingPipeline(
             grid_cols,
             seed_tiles_mode,
             tiles_mode,
+            tile_col_overflow,
         )
 
         if seed_reroll_regions is None:
@@ -965,7 +972,10 @@ class StableDiffusionXLTilingPipeline(
 
         # update height and width tile size and tile overlap size
         height = tile_height + (grid_rows - 1) * (tile_height - tile_row_overlap)
-        width = tile_width + (grid_cols - 1) * (tile_width - tile_col_overlap)
+        if tile_col_overflow:
+            width = grid_cols * (tile_width - tile_col_overlap)
+        else:
+            width = tile_width + (grid_cols - 1) * (tile_width - tile_col_overlap)
 
         # 3. Encode input prompt
         lora_scale = (
@@ -1003,8 +1013,32 @@ class StableDiffusionXLTilingPipeline(
                     if (seed_tile := seed_tiles[row][col]) is not None:
                         mode = seed_tiles_mode[row][col]
                         if mode == self.SeedTilesMode.FULL.value:
-                            row_init, row_end, col_init, col_end = _tile2latent_indices(
+                            l_row_init, l_row_end, l_col_init, l_col_end = _tile2latent_indices(
                                 row, col, tile_width, tile_height, tile_row_overlap, tile_col_overlap
+                            )
+                            tile_generator = torch.Generator(device).manual_seed(seed_tile)
+                            tile_latent_h = l_row_end - l_row_init
+                            tile_latent_w = tile_width // 8
+                            tile_shape = (latents_shape[0], latents_shape[1], tile_latent_h, tile_latent_w)
+                            new_latents_for_tile = torch.randn(
+                                tile_shape, generator=tile_generator, device=device, dtype=dtype
+                            )
+
+                            if tile_col_overflow and l_col_end > latents.shape[3]:
+                                overflow_w = l_col_end - latents.shape[3]
+                                # right part
+                                latents[
+                                    :, :, l_row_init:l_row_end, l_col_init : latents.shape[3]
+                                ] = new_latents_for_tile[:, :, :, :-overflow_w]
+                                # left part (wrap)
+                                latents[:, :, l_row_init:l_row_end, 0:overflow_w] = new_latents_for_tile[
+                                    :, :, :, -overflow_w:
+                                ]
+                            else:
+                                latents[:, :, l_row_init:l_row_end, l_col_init:l_col_end] = new_latents_for_tile
+                        elif tile_col_overflow:
+                            logger.warning(
+                                f"Tile seed for ({row}, {col}) ignored. `seed_tiles_mode='exclusive'` is not supported with `tile_col_overflow=True`."
                             )
                         else:
                             row_init, row_end, col_init, col_end = _tile2latent_exclusive_indices(
@@ -1017,11 +1051,11 @@ class StableDiffusionXLTilingPipeline(
                                 grid_rows,
                                 grid_cols,
                             )
-                        tile_generator = torch.Generator(device).manual_seed(seed_tile)
-                        tile_shape = (latents_shape[0], latents_shape[1], row_end - row_init, col_end - col_init)
-                        latents[:, :, row_init:row_end, col_init:col_end] = torch.randn(
-                            tile_shape, generator=tile_generator, device=device
-                        )
+                            tile_generator = torch.Generator(device).manual_seed(seed_tile)
+                            tile_shape = (latents_shape[0], latents_shape[1], row_end - row_init, col_end - col_init)
+                            latents[:, :, row_init:row_end, col_init:col_end] = torch.randn(
+                                tile_shape, generator=tile_generator, device=device, dtype=dtype
+                            )
 
         # 3.2 overwrite again for seed reroll regions
         for row_init, row_end, col_init, col_end, seed_reroll in seed_reroll_regions:
@@ -1031,7 +1065,7 @@ class StableDiffusionXLTilingPipeline(
             reroll_generator = torch.Generator(device).manual_seed(seed_reroll)
             region_shape = (latents_shape[0], latents_shape[1], row_end - row_init, col_end - col_init)
             latents[:, :, row_init:row_end, col_init:col_end] = torch.randn(
-                region_shape, generator=reroll_generator, device=device
+                region_shape, generator=reroll_generator, device=device, dtype=dtype
             )
 
         # 4. Prepare timesteps
@@ -1112,10 +1146,19 @@ class StableDiffusionXLTilingPipeline(
                     for col in range(grid_cols):
                         if self.interrupt:
                             continue
-                        px_row_init, px_row_end, px_col_init, px_col_end = _tile2latent_indices(
+                        l_row_init, l_row_end, l_col_init, l_col_end = _tile2latent_indices(
                             row, col, tile_width, tile_height, tile_row_overlap, tile_col_overlap
                         )
-                        tile_latents = latents[:, :, px_row_init:px_row_end, px_col_init:px_col_end]
+
+                        if tile_col_overflow and l_col_end > latents.shape[3]:
+                            overflow_w = l_col_end - latents.shape[3]
+                            # Latent from right edge
+                            latents_right = latents[:, :, l_row_init:l_row_end, l_col_init : latents.shape[3]]
+                            # Latent from left edge (wrap around)
+                            latents_left = latents[:, :, l_row_init:l_row_end, 0:overflow_w]
+                            tile_latents = torch.cat([latents_right, latents_left], dim=3)
+                        else:
+                            tile_latents = latents[:, :, l_row_init:l_row_end, l_col_init:l_col_end]
                         # expand the latents if we are doing classifier free guidance
                         latent_model_input = (
                             torch.cat([tile_latents] * 2) if self.do_classifier_free_guidance else tile_latents
@@ -1156,13 +1199,32 @@ class StableDiffusionXLTilingPipeline(
                 # Add each tile contribution to overall latents
                 for row in range(grid_rows):
                     for col in range(grid_cols):
-                        px_row_init, px_row_end, px_col_init, px_col_end = _tile2latent_indices(
+                        l_row_init, l_row_end, l_col_init, l_col_end = _tile2latent_indices(
                             row, col, tile_width, tile_height, tile_row_overlap, tile_col_overlap
                         )
-                        noise_pred[:, :, px_row_init:px_row_end, px_col_init:px_col_end] += (
-                            noise_preds[row][col] * tile_weights
-                        )
-                        contributors[:, :, px_row_init:px_row_end, px_col_init:px_col_end] += tile_weights
+
+                        current_noise_pred = noise_preds[row][col] * tile_weights
+                        current_weights = tile_weights
+
+                        if tile_col_overflow and l_col_end > latents.shape[3]:
+                            overflow_w = l_col_end - latents.shape[3]
+
+                            # part for the right edge
+                            noise_pred_right = current_noise_pred[:, :, :, :-overflow_w]
+                            weights_right = current_weights[:, :, :, :-overflow_w]
+                            noise_pred[:, :, l_row_init:l_row_end, l_col_init : latents.shape[3]] += noise_pred_right
+                            contributors[
+                                :, :, l_row_init:l_row_end, l_col_init : latents.shape[3]
+                            ] += weights_right
+
+                            # part for the left edge
+                            noise_pred_left = current_noise_pred[:, :, :, -overflow_w:]
+                            weights_left = current_weights[:, :, :, -overflow_w:]
+                            noise_pred[:, :, l_row_init:l_row_end, 0:overflow_w] += noise_pred_left
+                            contributors[:, :, l_row_init:l_row_end, 0:overflow_w] += weights_left
+                        else:
+                            noise_pred[:, :, l_row_init:l_row_end, l_col_init:l_col_end] += current_noise_pred
+                            contributors[:, :, l_row_init:l_row_end, l_col_init:l_col_end] += current_weights
 
                 # Average overlapping areas with more than 1 contributor
                 noise_pred /= contributors
