@@ -1167,11 +1167,14 @@ class StableDiffusionXLTilingPipeline(
 
                 # Average overlapping areas with more than 1 contributor
                 if seamless_overlap is not None and seamless_overlap > 0 :
-                    n1 = noise_pred[:, :, :, :seamless_overlap]
-                    n2 = noise_pred[:, :, :, -seamless_overlap:]                    
+                    tw = self._gaussian_weights(seamless_overlap * 2, tile_height, batch_size, device, torch.float32)
 
-                    c1 = contributors[:, :, :, :seamless_overlap]
-                    c2 = contributors[:, :, :, -seamless_overlap:]
+                    n1 = noise_pred[:, :, :, :seamless_overlap] * tw[:, :, :, :seamless_overlap]
+                    n2 = noise_pred[:, :, :, -seamless_overlap:] * tw[:, :, :, -seamless_overlap:]
+                    
+
+                    c1 = tw[:, :, :, :seamless_overlap]
+                    c2 = tw[:, :, :, -seamless_overlap:]
 
                     noise_pred[:, :, :, :seamless_overlap] += n2
                     noise_pred[:, :, :, -seamless_overlap:] += n1
